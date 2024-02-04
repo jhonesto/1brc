@@ -15,21 +15,19 @@
  */
 package dev.morling.onebrc;
 
-import java.io.*;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.ArrayList;
+import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
-import java.util.zip.CRC32;
-import java.util.zip.Checksum;
 
 public class CalculateAverage_jhonesto {
 
@@ -50,8 +48,6 @@ public class CalculateAverage_jhonesto {
     private static int MAX_BUFFER_SIZE = 2_147_483_647 - 200;
 
     private static final short RADIX = 10;
-    private static final short MIN_VALUE = -1000;
-    private static final short MAX_VALUE = 1000;
 
     private static final long ZERO_LONG = 0L;
 
@@ -60,8 +56,6 @@ public class CalculateAverage_jhonesto {
     private static final char LINE_FEED = '\n';
     private static final char MINUS = '-';
     private static final char PERIOD = '.';
-    private static final char EQUAL = '=';
-    private static final char SLASH = '/';
 
     // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     // ++++++++++++++++++++++++++++++++++ MAIN +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -132,44 +126,42 @@ public class CalculateAverage_jhonesto {
 
             ExecutorService es = Executors.newFixedThreadPool(parts.size());
 
-            List<Future<HashMap<Long, Measurement>>> futures = new ArrayList<>();
+            List<Future<List<Result>>> futures = new ArrayList<>();
 
             for (Partition part : parts) {
-                futures.add(es.submit(() -> {
-                    return part.execute();
-                }));
+                futures.add(es.submit(part::compute));
             }
 
-            List<HashMap<Long, Measurement>> lista = new ArrayList<>();
+            List<List<Result>> lista = new ArrayList<>();
 
             for (int i = futures.size() - ONE; i >= ZERO; i--) {
-                HashMap<Long, Measurement> out = futures.get(i).get();
+                List<Result> out = futures.get(i).get();
                 lista.add(out);
             }
 
             es.shutdown();
 
-            var result =
-
-                    lista.stream()
-                            .parallel()
-                            .flatMap(hash -> hash.entrySet().stream())
-                            .collect(Collectors.filtering(
-                                    e -> e.getKey() != null, Collectors.toMap(
-                                            e -> e.getKey(),
-                                            e -> e.getValue(),
-                                            (e1, e2) -> {
-                                                byte[] station = e1.station;
-                                                short min = (short) Math.min(e1.min, e2.min);
-                                                short max = (short) Math.max(e1.max, e2.max);
-                                                int sum = e1.sum + e2.sum;
-                                                int count = e1.count + e2.count;
-                                                return new Measurement(station, min, max, sum, count);
-                                            })))
-                            .values().stream().parallel()
-                            .sorted((o1, o2) -> o1.compareTo(o2))
-                            .map(Measurement::toString)
-                            .collect(Collectors.joining(", "));
+            var result = lista
+                    .stream()
+                    .flatMap(List::stream)
+                    .collect(Collectors.groupingBy(Result::getStation))
+                    .values()
+                    .parallelStream()
+                    .map(results -> results.stream()
+                            .reduce((r1, r2) -> {
+                                r1.min = r1.min < r2.min ? r1.min : r2.min;
+                                r1.max = r1.max > r2.max ? r1.max : r2.max;
+                                r1.sum += r2.sum;
+                                r1.count += r2.count;
+                                return r1;
+                            }))
+                    .filter(Optional::isPresent)
+                    .map(Optional::get)
+                    .toList()
+                    .stream()
+                    .sorted(Result::compareTo)
+                    .map(Result::toString)
+                    .collect(Collectors.joining(", "));
 
             System.out.println("{" + result + "}");
 
@@ -194,7 +186,7 @@ public class CalculateAverage_jhonesto {
 
         int size;
 
-        HashMap<Long, Measurement> table = new HashMap<>(785, 0.8f);
+        HashMap<Integer, Measurement> table = new HashMap<>(785, 0.8f);
 
         public Partition(MappedByteBuffer map, long position, int last, int size) {
             this.map = map;
@@ -203,11 +195,11 @@ public class CalculateAverage_jhonesto {
             this.size = size;
         }
 
-        public HashMap<Long, Measurement> execute() {
+        public List<Result> compute() {
 
             byte[] m = new byte[MAX_PER_LINE];
 
-            byte lf = NEW_LINE;
+            byte lf;
 
             for (int i = ZERO, pos = ZERO; i < this.size; i += ONE) {
 
@@ -229,31 +221,53 @@ public class CalculateAverage_jhonesto {
 
             m = null;
 
-            return table;
+            List<Result> resultList = new ArrayList<>(table.size());
+
+            table.forEach((key, value) -> resultList.addAll(value.getResultList()));
+
+            return resultList;
         }
 
     }
 
     private static class Measurement {
 
-        private byte[] station;
+        private final Result result;
 
-        private short max = MIN_VALUE;
+        private Measurement next;
 
-        private short min = MAX_VALUE;
+        public Measurement(byte[] station, short t) {
 
-        private int sum = ZERO;
+            this.result = new Result(station, t, t, t, ONE);
 
-        private int count = ZERO;
-
-        private boolean firstMeasure = true;
-
-        public Measurement(byte[] station, short temperature) {
-            this.station = station;
-            this.setTemperature(temperature);
         }
 
-        public Measurement(byte[] station, short min, short max, int sum, int count) {
+        public void setTemperature(short t) {
+
+            result.max = result.max < t ? t : result.max;
+            result.min = result.min > t ? t : result.min;
+            result.sum = result.sum + t;
+            result.count = result.count + ONE;
+
+        }
+
+        public List<Result> getResultList() {
+
+            return getResults(this);
+
+        }
+
+    }
+
+    private static class Result {
+
+        byte[] station;
+        short min;
+        short max;
+        int sum;
+        int count;
+
+        public Result(byte[] station, short min, short max, int sum, int count) {
             this.station = station;
             this.min = min;
             this.max = max;
@@ -262,36 +276,21 @@ public class CalculateAverage_jhonesto {
 
         }
 
-        private void setTemperature(short t) {
-
-            if (firstMeasure) {
-                sum = max = min = t;
-                firstMeasure = false;
-                count = ONE;
-                return;
-            }
-
-            max = max < t ? t : max;
-            min = min > t ? t : min;
-            sum += t;
-            count += ONE;
-
+        public String getStation() {
+            return new String(station, StandardCharsets.UTF_8).trim();
         }
 
-        @Override
         public String toString() {
-
             return String.format("%s=%.1f/%.1f/%.1f",
-                    new String(station, StandardCharsets.UTF_8).trim(),
+                    new String(this.station, StandardCharsets.UTF_8).trim(),
                     Math.round(min) / TEN_DOUBLE,
                     Math.round(sum / (double) count) / TEN_DOUBLE,
                     Math.round(max) / TEN_DOUBLE);
         }
 
-        public int compareTo(Measurement other) {
+        public int compareTo(Result other) {
             return new String(this.station).compareTo(new String(other.station));
         }
-
     }
 
     // +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -332,7 +331,7 @@ public class CalculateAverage_jhonesto {
         return b;
     }
 
-    private static void resolveMeasurement(byte[] measurement, HashMap<Long, Measurement> table) {
+    private static void resolveMeasurement(byte[] measurement, HashMap<Integer, Measurement> table) {
 
         short temperature = 0;
 
@@ -358,12 +357,18 @@ public class CalculateAverage_jhonesto {
 
         byte[] station = asByteArrayCopy(measurement, j);
 
-        long hash = getHash(station);
+        int hash = getHash(station);
 
         Measurement m = table.get(hash);
 
         if (m != null) {
-            m.setTemperature(temperature);
+            // Thanks to Roy's comment, I understood how to handle the situation appropriately.
+            if (Arrays.equals(m.result.station, station)) {
+                m.setTemperature(temperature);
+                return;
+            }
+
+            addNextMeasurement(m, station, temperature);
 
         }
         else {
@@ -371,6 +376,39 @@ public class CalculateAverage_jhonesto {
             table.put(hash, m);
         }
 
+    }
+
+    private static void addNextMeasurement(Measurement m, byte[] station, short temperature) {
+
+        Measurement tmp = m.next;
+
+        while (tmp != null) {
+            if (Arrays.equals(tmp.result.station, station)) {
+                tmp.setTemperature(temperature);
+                return;
+            }
+            else {
+                tmp = tmp.next;
+            }
+        }
+
+        m.next = new Measurement(station, temperature);
+    }
+
+    private static List<Result> getResults(Measurement m) {
+
+        List<Result> results = new ArrayList<>();
+
+        results.add(m.result);
+
+        m = m.next;
+
+        while (m != null) {
+            results.add(m.result);
+            m = m.next;
+        }
+
+        return results;
     }
 
     private static short pow(short base, short exponent) {
@@ -385,12 +423,8 @@ public class CalculateAverage_jhonesto {
 
     }
 
-    public static long getHash(byte[] b) {
-        Checksum crc32 = new CRC32();
-
-        crc32.update(b, ZERO, b.length);
-
-        return crc32.getValue();
+    public static int getHash(byte[] b) {
+        return Arrays.hashCode(b);
     }
 
 }
